@@ -1,368 +1,535 @@
-import * as Utils from './math_util.js'
-
 /** Plan *
  * Store 50 * 50 * 50 voxel initialized as flat plane
- * CPU calculates 3d mouse position by raycasting through voxel
- * Compute shader takes voxel and mouse position, updates voxel and outputs it to next shader
- * Actually, do this on cpu, not shader
+ * CPU takes 2d mouse position and gets the ray
+ * Compute shader takes ray as a uniform (as well as brush info) and updates grid
  * Compute shader takes updated voxel buffer and outputs a vertex buffer with vertices and normals. This is where we use marching cubes
  * Render shader draws triangles using the generated vertex buffer
- * Separate render shader (?) draws mouse position
+ * Separate render shader draws mouse position
 */
 
-const voxelResolution = 30;
-const numPoints = voxelResolution * voxelResolution * voxelResolution;
-const clearColor = { r: 0.03, g: 0.03, b: 0.05, a: 0.0 };
+import * as Utils from './math_util.js';
 
-function setVoxelPoint(voxel, val, x, y, z) {
-    if (x >= voxelResolution || y >= voxelResolution || z >= voxelResolution) return;
-    if (x < 0|| y < 0 || z < 0) return;
-
-    voxel[z*voxelResolution**2 + y*voxelResolution + x] = val
-}
-
-function getVoxelPoint(voxel, x, y, z) {
-    if (x >= voxelResolution || y >= voxelResolution || z >= voxelResolution) return -1;
-    if (x < 0|| y < 0 || z < 0) return -1;
-
-    return voxel[z*voxelResolution**2 + y*voxelResolution + x]
-}
-
-// TODO voxel matrix should have continuous values; marching cubes will actual vertex positions
-// for debugging, we will just use values of 1 or 0
-function initVoxel() {
-    const voxel = new Array(numPoints).fill(0);
-
-    // From starting configuration:
-    // +X -> Right
-    // +Y -> Up
-    // +Z -> Towards camera
-
-    for (let z = 0; z < voxelResolution; z++) {
-        for (let x = 0; x < voxelResolution; x++) {
-            setVoxelPoint(voxel, 1, x, 1, z);
-        }
-    }
-    return voxel;
-}
-
-function DEBUG_getVoxelVertices(voxel) {
-    const vertexData = [];
-    const triangle_indices = [];
-    const line_indices = [];
-
-    const h = 2.0 / voxelResolution;
-    const topColor = [0.3, 0.65, 0.3];
-    const sideColor = [0.5, 0.4, 0.3];
-
-    for (let z = 0; z < voxelResolution; z++) {
-        for (let y = 0; y < voxelResolution; y++) {
-            for (let x = 0; x < voxelResolution; x++) {
-                if (getVoxelPoint(voxel, x, y, z) === 1) {
-                    const xMin = -1.0 + x * h;
-                    const xMax = -1.0 + (x + 1) * h;
-                    const yMin = -1.0 + y * h;
-                    const yMax = -1.0 + (y + 1) * h;
-                    const zMin = -1.0 + z * h;
-                    const zMax = -1.0 + (z + 1) * h;
-
-                    const faces = [];
-
-                    // Front face (normal [0, 0, 1])
-                    if (getVoxelPoint(voxel, x, y, z + 1) !== 1) {
-                        faces.push({
-                            verts: [
-                                [xMin, yMin, zMax],
-                                [xMax, yMin, zMax],
-                                [xMax, yMax, zMax],
-                                [xMin, yMax, zMax]
-                            ],
-                            n: [0, 0, 1],
-                            color: sideColor
-                        });
-                    }
-
-                    // Back face (normal [0, 0, -1])
-                    if (getVoxelPoint(voxel, x, y, z - 1) !== 1) {
-                        faces.push({
-                            verts: [
-                                [xMax, yMin, zMin],
-                                [xMin, yMin, zMin],
-                                [xMin, yMax, zMin],
-                                [xMax, yMax, zMin]
-                            ],
-                            n: [0, 0, -1],
-                            color: sideColor
-                        });
-                    }
-
-                    // Top face (normal [0, 1, 0])
-                    if (getVoxelPoint(voxel, x, y + 1, z) !== 1) {
-                        faces.push({
-                            verts: [
-                                [xMin, yMax, zMax],
-                                [xMax, yMax, zMax],
-                                [xMax, yMax, zMin],
-                                [xMin, yMax, zMin]
-                            ],
-                            n: [0, 1, 0],
-                            color: topColor
-                        });
-                    }
-
-                    // Bottom face (normal [0, -1, 0])
-                    if (getVoxelPoint(voxel, x, y - 1, z) !== 1) {
-                        faces.push({
-                            verts: [
-                                [xMin, yMin, zMin],
-                                [xMax, yMin, zMin],
-                                [xMax, yMin, zMax],
-                                [xMin, yMin, zMax]
-                            ],
-                            n: [0, -1, 0],
-                            color: sideColor
-                        });
-                    }
-
-                    // Right face (normal [1, 0, 0])
-                    if (getVoxelPoint(voxel, x + 1, y, z) !== 1) {
-                        faces.push({
-                            verts: [
-                                [xMax, yMin, zMax],
-                                [xMax, yMin, zMin],
-                                [xMax, yMax, zMin],
-                                [xMax, yMax, zMax]
-                            ],
-                            n: [1, 0, 0],
-                            color: sideColor
-                        });
-                    }
-
-                    // Left face (normal [-1, 0, 0])
-                    if (getVoxelPoint(voxel, x - 1, y, z) !== 1) {
-                        faces.push({
-                            verts: [
-                                [xMin, yMin, zMin],
-                                [xMin, yMin, zMax],
-                                [xMin, yMax, zMax],
-                                [xMin, yMax, zMin]
-                            ],
-                            n: [-1, 0, 0],
-                            color: sideColor
-                        });
-                    }
-
-                    faces.forEach(face => {
-                        const base = vertexData.length / 9; // 9 elements per vertex
-                        face.verts.forEach(v => {
-                            vertexData.push(...v);          // pos (3 floats)
-                            vertexData.push(...face.n);     // normal (3 floats)
-                            vertexData.push(...face.color); // color (3 floats)
-                        });
-
-                        line_indices.push(base, base + 1, base + 1, base + 2, base + 2, base + 3, base + 3, base);
-                        triangle_indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
-                    });
-                }
-            }
-        }
-    }
-
-    return {
-        vertexData: new Float32Array(vertexData),
-        triangle_indices: new Uint16Array(triangle_indices),
-        line_indices: new Uint16Array(line_indices),
-        triangle_count: triangle_indices.length,
-        line_count: line_indices.length
-    };
-}
-
-// Takes 2d mouse position, raycasts and returns the voxel position it hits
-async function getMouse3D(cam_pos, mouseX, mouseY) {
-    const rayDir = [mouseX, mouseY, 0];
-    rayDir[0] -= cam_pos[0];
-    rayDir[1] -= cam_pos[1];
-    rayDir[2] -= cam_pos[2];
-    
-    console.log(rayDir);
-}
-
-function createBox() {
-    // 6 faces, each with 4 unique vertices (for flat normals), 2 triangles
-    const faceData = [
-        // positions (4 verts)           normal           color
-        // { verts: [[-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]], n: [0, 0, 1], color: [0.30, 0.60, 1.00] },  // front  – blue
-        // { verts: [[1, -1, -1], [-1, -1, -1], [-1, 1, -1], [1, 1, -1]], n: [0, 0, -1], color: [0.20, 0.80, 0.50] },  // back   – green
-        // { verts: [[-1, 1, 1], [1, 1, 1], [1, 1, -1], [-1, 1, -1]], n: [0, 1, 0], color: [1.00, 0.35, 0.40] },  // top    – red
-        { verts: [[-1, 0, -1], [1, 0, -1], [1, 0, 1], [-1, 0, 1]], n: [0, -1, 0], color: [1.00, 0.75, 0.20] },  // bottom – gold
-        // { verts: [[1, -1, 1], [1, -1, -1], [1, 1, -1], [1, 1, 1]], n: [1, 0, 0], color: [0.85, 0.30, 0.90] },  // right  – purple
-        // { verts: [[-1, -1, -1], [-1, -1, 1], [-1, 1, 1], [-1, 1, -1]], n: [-1, 0, 0], color: [0.10, 0.85, 0.85] },  // left   – cyan
-    ];
-
-    const vertexData = [];
-    const triangle_indices = [];
-    const line_indices = [];
-
-    faceData.forEach((face, i) => {
-        const base = i * 4;
-        face.verts.forEach(v => {
-            vertexData.push(...v);          // pos (3)
-            vertexData.push(...face.color); // color (3)
-            vertexData.push(...face.n);     // normal (3)
-        });
-
-        line_indices.push(base, base + 1, base + 1, base + 2, base + 2, base + 3, base + 3, base);
-        triangle_indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
-    });
-
-    return {
-        vertexData: new Float32Array(vertexData),
-        triangle_indices: new Uint16Array(triangle_indices),
-        line_indices: new Uint16Array(line_indices),
-        triangle_count: triangle_indices.length,
-        line_count: line_indices.length
-    };
-}
+const VOXEL_RESOLUTION = 30;
+const NUM_POINTS = VOXEL_RESOLUTION * VOXEL_RESOLUTION * VOXEL_RESOLUTION;
 
 async function createShaderModule(device, path) {
     const response = await fetch(path);
     const shaderSource = await response.text();
     return device.createShaderModule({
         code: shaderSource
-    })
+    });
 }
 
-async function init() {
-    if (!navigator.gpu) {
-        throw new Error("WebGPU not supported!");
+class VoxelGrid {
+    constructor(resolution = VOXEL_RESOLUTION) {
+        this.resolution = resolution;
+        this.numPoints = resolution * resolution * resolution;
+        this.data = new Array(this.numPoints).fill(0);
+        this.initDefaultPlane();
     }
 
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) {
-        throw new Error("No appropriate GPUAdapter found!");
-    }
-    const device = await adapter.requestDevice();
-    const canvas = document.getElementById("canvas");
-
-    // Resize canvas to match display size (handles high-DPI)
-    const dpr = window.devicePixelRatio || 1;
-    const w = canvas.clientWidth * dpr | 0;
-    const h = canvas.clientHeight * dpr | 0;
-    if (canvas.width !== w || canvas.height !== h) {
-        canvas.width = w;
-        canvas.height = h;
+    set(val, x, y, z) {
+        if (x >= this.resolution || y >= this.resolution || z >= this.resolution) return;
+        if (x < 0 || y < 0 || z < 0) return;
+        this.data[z * this.resolution ** 2 + y * this.resolution + x] = val;
     }
 
-    // Set up context
-    const context = canvas.getContext("webgpu")
-    context.configure({
-        device: device,
-        format: navigator.gpu.getPreferredCanvasFormat(),
-        alphaMode: "premultiplied"
-    })
+    get(x, y, z) {
+        if (x >= this.resolution || y >= this.resolution || z >= this.resolution) return -1;
+        if (x < 0 || y < 0 || z < 0) return -1;
+        return this.data[z * this.resolution ** 2 + y * this.resolution + x];
+    }
 
-    // Set up shader modules
-    const terrainShaderModule = await createShaderModule(device, "./render.wgsl");
-
-    // Uniforms: mat4x4 (64) vec3 (12) + pad (4) = 80
-    const renderUniformBufferSize = 80;
-    const uniformBuffer = device.createBuffer({
-        size: renderUniformBufferSize,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-
-    const voxel = initVoxel();
-    const voxelMesh = DEBUG_getVoxelVertices(voxel);
-
-    const voxelVertexBuffer = device.createBuffer({
-        size: voxelMesh.vertexData.byteLength,
-        usage: GPUBufferUsage.VERTEX |  GPUBufferUsage.COPY_DST,
-    });
-    const voxelIndicesBuffer = device.createBuffer({
-        size: voxelMesh.triangle_indices.byteLength,
-        usage: GPUBufferUsage.INDEX |  GPUBufferUsage.COPY_DST,
-    });
-
-    device.queue.writeBuffer(voxelVertexBuffer, 0, voxelMesh.vertexData);
-    device.queue.writeBuffer(voxelIndicesBuffer, 0, voxelMesh.triangle_indices);
-
-    const voxelVertexBuffersLayout = [{
-        attributes: [
-            { shaderLocation: 0, offset: 0, format: 'float32x3' },  // position
-            { shaderLocation: 1, offset: 12, format: 'float32x3' }, // normal
-            { shaderLocation: 2, offset: 24, format: 'float32x3' }  // color
-        ],
-        arrayStride: 36, // 9 floats * 4 bytes
-        stepMode: 'vertex'
-    }];
-
-    const voxelPipeline = device.createRenderPipeline({
-        layout: "auto",
-        vertex: {
-            module: terrainShaderModule,
-            entryPoint: "vertex_main",
-            buffers: voxelVertexBuffersLayout,
-        },
-        fragment: {
-            module: terrainShaderModule,
-            entryPoint: "fragment_main",
-            targets: [{
-                format: navigator.gpu.getPreferredCanvasFormat(),
-            }],
-        },
-        primitive: {
-            topology: "triangle-list",
-            cullMode: 'back',
-        },
-        depthStencil: {
-            depthWriteEnabled: true,
-            depthCompare: 'less',
-            format: 'depth24plus',
-        },
-    });
-
-    const depthTexture = device.createTexture({
-        size: [canvas.width, canvas.height],
-        format: 'depth24plus',
-        usage: GPUTextureUsage.RENDER_ATTACHMENT,
-    });
-
-    const bindGroup = device.createBindGroup({
-        layout: voxelPipeline.getBindGroupLayout(0),
-        entries: [{
-            binding: 0,
-            resource: {
-                buffer: uniformBuffer,
+    initDefaultPlane() {
+        // Initialize a flat plane at y = 1
+        for (let z = 0; z < this.resolution; z++) {
+            for (let x = 0; x < this.resolution; x++) {
+                this.set(1, x, 1, z);
             }
-        }]
-    });
+        }
+    }
 
-    // Setup
-    const input = window.inputState || { deltaX: 0, deltaY: 0, velocityX: 0, velocityY: 0, zoom: 7, interacting: false, mouseX: 0, mouseY: 0, ndcX: 0, ndcY: 0 };
-    
-    // ---- Matrices ----
-    const proj = Utils.mat4Create();
-    const view = Utils.mat4Create();
-    const mv = Utils.mat4Create();
-    const mvp = Utils.mat4Create();
-    const norm = Utils.mat4Create();
+    generateMesh() {
+        const vertexData = [];
+        const triangleIndices = [];
+        const lineIndices = [];
 
-    // Persistent model rotation matrix — accumulated over time
-    const modelRotation = Utils.mat4Create();
-    const temp = Utils.mat4Create();
+        const h = 2.0 / this.resolution;
+        const topColor = [0.3, 0.65, 0.3];
+        const sideColor = [0.5, 0.4, 0.3];
 
-    // Apply an initial tilt so we see three faces
-    Utils.mat4RotateX(modelRotation, modelRotation, 0.35);
+        for (let z = 0; z < this.resolution; z++) {
+            for (let y = 0; y < this.resolution; y++) {
+                for (let x = 0; x < this.resolution; x++) {
+                    if (this.get(x, y, z) === 1) {
+                        const xMin = -1.0 + x * h;
+                        const xMax = -1.0 + (x + 1) * h;
+                        const yMin = -1.0 + y * h;
+                        const yMax = -1.0 + (y + 1) * h;
+                        const zMin = -1.0 + z * h;
+                        const zMax = -1.0 + (z + 1) * h;
 
-    // Projection
-    const aspect = canvas.width / canvas.height;
-    Utils.mat4Perspective(proj, Math.PI / 6, aspect, 0.1, 100);
-    
-    const lightDirWorld = [0.0, 0.7, 1.0]; 
+                        const faces = [];
 
-    function frame() {
+                        // Front face (normal [0, 0, 1])
+                        if (this.get(x, y, z + 1) !== 1) {
+                            faces.push({
+                                verts: [
+                                    [xMin, yMin, zMax],
+                                    [xMax, yMin, zMax],
+                                    [xMax, yMax, zMax],
+                                    [xMin, yMax, zMax]
+                                ],
+                                n: [0, 0, 1],
+                                color: sideColor
+                            });
+                        }
+
+                        // Back face (normal [0, 0, -1])
+                        if (this.get(x, y, z - 1) !== 1) {
+                            faces.push({
+                                verts: [
+                                    [xMax, yMin, zMin],
+                                    [xMin, yMin, zMin],
+                                    [xMin, yMax, zMin],
+                                    [xMax, yMax, zMin]
+                                ],
+                                n: [0, 0, -1],
+                                color: sideColor
+                            });
+                        }
+
+                        // Top face (normal [0, 1, 0])
+                        if (this.get(x, y + 1, z) !== 1) {
+                            faces.push({
+                                verts: [
+                                    [xMin, yMax, zMax],
+                                    [xMax, yMax, zMax],
+                                    [xMax, yMax, zMin],
+                                    [xMin, yMax, zMin]
+                                ],
+                                n: [0, 1, 0],
+                                color: topColor
+                            });
+                        }
+
+                        // Bottom face (normal [0, -1, 0])
+                        if (this.get(x, y - 1, z) !== 1) {
+                            faces.push({
+                                verts: [
+                                    [xMin, yMin, zMin],
+                                    [xMax, yMin, zMin],
+                                    [xMax, yMin, zMax],
+                                    [xMin, yMin, zMax]
+                                ],
+                                n: [0, -1, 0],
+                                color: sideColor
+                            });
+                        }
+
+                        // Right face (normal [1, 0, 0])
+                        if (this.get(x + 1, y, z) !== 1) {
+                            faces.push({
+                                verts: [
+                                    [xMax, yMin, zMax],
+                                    [xMax, yMin, zMin],
+                                    [xMax, yMax, zMin],
+                                    [xMax, yMax, zMax]
+                                ],
+                                n: [1, 0, 0],
+                                color: sideColor
+                            });
+                        }
+
+                        // Left face (normal [-1, 0, 0])
+                        if (this.get(x - 1, y, z) !== 1) {
+                            faces.push({
+                                verts: [
+                                    [xMin, yMin, zMin],
+                                    [xMin, yMin, zMax],
+                                    [xMin, yMax, zMax],
+                                    [xMin, yMax, zMin]
+                                ],
+                                n: [-1, 0, 0],
+                                color: sideColor
+                            });
+                        }
+
+                        faces.forEach(face => {
+                            const base = vertexData.length / 9; // 9 elements per vertex
+                            face.verts.forEach(v => {
+                                vertexData.push(...v);          // pos (3 floats)
+                                vertexData.push(...face.n);     // normal (3 floats)
+                                vertexData.push(...face.color); // color (3 floats)
+                            });
+
+                            lineIndices.push(base, base + 1, base + 1, base + 2, base + 2, base + 3, base + 3, base);
+                            triangleIndices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+                        });
+                    }
+                }
+            }
+        }
+
+        return {
+            vertexData: new Float32Array(vertexData),
+            triangleIndices: new Uint16Array(triangleIndices),
+            lineIndices: new Uint16Array(lineIndices),
+            triangleCount: triangleIndices.length,
+            lineCount: lineIndices.length
+        };
+    }
+}
+
+class TerrainRenderer {
+    static async create(device, colorFormat, depthFormat) {
+        const shaderModule = await createShaderModule(device, "./render.wgsl");
+        return new TerrainRenderer(device, shaderModule, colorFormat, depthFormat);
+    }
+
+    constructor(device, shaderModule, colorFormat, depthFormat) {
+        this.device = device;
+
+        // Create uniform buffer: MVP mat4x4f (64 bytes) + LightDir vec3f (12 bytes) + pad (4 bytes) = 80 bytes
+        this.uniformBuffer = device.createBuffer({
+            size: 80,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        const vertexLayout = [{
+            attributes: [
+                { shaderLocation: 0, offset: 0, format: 'float32x3' },  // position
+                { shaderLocation: 1, offset: 12, format: 'float32x3' }, // normal
+                { shaderLocation: 2, offset: 24, format: 'float32x3' }  // color
+            ],
+            arrayStride: 36, // 9 floats * 4 bytes
+            stepMode: 'vertex'
+        }];
+
+        this.pipeline = device.createRenderPipeline({
+            label: "Terrain Render Pipeline",
+            layout: "auto",
+            vertex: {
+                module: shaderModule,
+                entryPoint: "vertex_main",
+                buffers: vertexLayout,
+            },
+            fragment: {
+                module: shaderModule,
+                entryPoint: "fragment_main",
+                targets: [{ format: colorFormat }],
+            },
+            primitive: {
+                topology: "triangle-list",
+                cullMode: 'back',
+            },
+            depthStencil: {
+                depthWriteEnabled: true,
+                depthCompare: 'less',
+                format: depthFormat,
+            },
+        });
+
+        this.bindGroup = device.createBindGroup({
+            layout: this.pipeline.getBindGroupLayout(0),
+            entries: [{
+                binding: 0,
+                resource: { buffer: this.uniformBuffer }
+            }]
+        });
+
+        this.vertexBuffer = null;
+        this.indexBuffer = null;
+        this.triangleCount = 0;
+    }
+
+    updateMesh(meshData) {
+        if (this.vertexBuffer) this.vertexBuffer.destroy();
+        if (this.indexBuffer) this.indexBuffer.destroy();
+
+        this.triangleCount = meshData.triangleCount;
+
+        if (meshData.vertexData.byteLength === 0) {
+            this.vertexBuffer = null;
+            this.indexBuffer = null;
+            return;
+        }
+
+        this.vertexBuffer = this.device.createBuffer({
+            size: meshData.vertexData.byteLength,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        });
+        this.indexBuffer = this.device.createBuffer({
+            size: meshData.triangleIndices.byteLength,
+            usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+        });
+
+        this.device.queue.writeBuffer(this.vertexBuffer, 0, meshData.vertexData);
+        this.device.queue.writeBuffer(this.indexBuffer, 0, meshData.triangleIndices);
+    }
+
+    updateUniforms(mvp, lightDir) {
+        const uniformData = new Float32Array(20); // mvp(16), lightDirWorld(3), padding(1)
+        uniformData.set(mvp, 0);
+        uniformData.set(lightDir, 16);
+        this.device.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
+    }
+
+    draw(passEncoder) {
+        if (!this.vertexBuffer || !this.indexBuffer || this.triangleCount === 0) return;
+
+        passEncoder.setPipeline(this.pipeline);
+        passEncoder.setBindGroup(0, this.bindGroup);
+        passEncoder.setVertexBuffer(0, this.vertexBuffer);
+        passEncoder.setIndexBuffer(this.indexBuffer, 'uint16');
+        passEncoder.drawIndexed(this.triangleCount);
+    }
+}
+
+// ============================================================
+//  5. BOX / GIZMO RENDERER PIPELINE
+// ============================================================
+class BoxRenderer {
+    static async create(device, colorFormat, depthFormat) {
+        const shaderModule = await createShaderModule(device, "./box.wgsl");
+        return new BoxRenderer(device, shaderModule, colorFormat, depthFormat);
+    }
+
+    constructor(device, shaderModule, colorFormat, depthFormat) {
+        this.device = device;
+
+        // Uniforms: MVP mat4x4f (64 bytes) + NormalMatrix mat4x4f (64 bytes) + LightDir vec3f (12 bytes) + pad (4 bytes) = 144 bytes
+        this.uniformBuffer = device.createBuffer({
+            size: 144,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        const vertexLayout = [{
+            attributes: [
+                { shaderLocation: 0, offset: 0, format: 'float32x3' },  // position
+                { shaderLocation: 1, offset: 12, format: 'float32x3' }, // color
+                { shaderLocation: 2, offset: 24, format: 'float32x3' }  // normal
+            ],
+            arrayStride: 36, // 9 floats * 4 bytes
+            stepMode: 'vertex'
+        }];
+
+        this.pipeline = device.createRenderPipeline({
+            label: "Box Render Pipeline",
+            layout: "auto",
+            vertex: {
+                module: shaderModule,
+                entryPoint: "vertex_main",
+                buffers: vertexLayout,
+            },
+            fragment: {
+                module: shaderModule,
+                entryPoint: "fragment_main",
+                targets: [{ format: colorFormat }],
+            },
+            primitive: {
+                topology: "triangle-list",
+                cullMode: 'back',
+            },
+            depthStencil: {
+                depthWriteEnabled: true,
+                depthCompare: 'less',
+                format: depthFormat,
+            },
+        });
+
+        this.bindGroup = device.createBindGroup({
+            layout: this.pipeline.getBindGroupLayout(0),
+            entries: [{
+                binding: 0,
+                resource: { buffer: this.uniformBuffer }
+            }]
+        });
+
+        // Initialize static Box Mesh
+        const boxMesh = this.generateBoxMesh();
+        this.vertexBuffer = device.createBuffer({
+            size: boxMesh.vertexData.byteLength,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        });
+        this.indexBuffer = device.createBuffer({
+            size: boxMesh.triangleIndices.byteLength,
+            usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+        });
+
+        device.queue.writeBuffer(this.vertexBuffer, 0, boxMesh.vertexData);
+        device.queue.writeBuffer(this.indexBuffer, 0, boxMesh.triangleIndices);
+        this.triangleCount = boxMesh.triangleCount;
+    }
+
+    generateBoxMesh() {
+        // 6 faces, each with 4 unique vertices (for flat normals), 2 triangles
+        // We will build a single bottom face for this demo, or we can uncomment others if desired.
+        const faceData = [
+            // bottom – gold
+            { verts: [[-1, 0, -1], [1, 0, -1], [1, 0, 1], [-1, 0, 1]], n: [0, -1, 0], color: [1.00, 0.75, 0.20] }, 
+        ];
+
+        const vertexData = [];
+        const triangleIndices = [];
+        const lineIndices = [];
+
+        faceData.forEach((face, i) => {
+            const base = i * 4;
+            face.verts.forEach(v => {
+                vertexData.push(...v);          // pos (3)
+                vertexData.push(...face.color); // color (3)
+                vertexData.push(...face.n);     // normal (3)
+            });
+
+            lineIndices.push(base, base + 1, base + 1, base + 2, base + 2, base + 3, base + 3, base);
+            triangleIndices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+        });
+
+        return {
+            vertexData: new Float32Array(vertexData),
+            triangleIndices: new Uint16Array(triangleIndices),
+            lineIndices: new Uint16Array(lineIndices),
+            triangleCount: triangleIndices.length,
+            lineCount: lineIndices.length
+        };
+    }
+
+    updateUniforms(mvp, normalMatrix, lightDir) {
+        const uniformData = new Float32Array(36); // mvp(16), normalMatrix(16), lightDirWorld(3), padding(1)
+        uniformData.set(mvp, 0);
+        uniformData.set(normalMatrix, 16);
+        uniformData.set(lightDir, 32);
+        this.device.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
+    }
+
+    draw(passEncoder) {
+        passEncoder.setPipeline(this.pipeline);
+        passEncoder.setBindGroup(0, this.bindGroup);
+        passEncoder.setVertexBuffer(0, this.vertexBuffer);
+        passEncoder.setIndexBuffer(this.indexBuffer, 'uint16');
+        passEncoder.drawIndexed(this.triangleCount);
+    }
+}
+
+// ============================================================
+//  6. MAIN ENGINE COORDINATOR
+// ============================================================
+class Engine {
+    constructor(canvasId) {
+        this.canvas = document.getElementById(canvasId);
+        if (!this.canvas) {
+            throw new Error(`Canvas with ID "${canvasId}" not found.`);
+        }
+        
+        this.device = null;
+        this.context = null;
+        this.colorFormat = null;
+        this.depthFormat = 'depth24plus';
+        this.depthTexture = null;
+
+        // Renderers
+        this.terrainRenderer = null;
+        this.boxRenderer = null;
+
+        // Voxel Grid
+        this.voxelGrid = new VoxelGrid();
+
+        // Matrices
+        this.proj = Utils.mat4Create();
+        this.view = Utils.mat4Create();
+        this.mv = Utils.mat4Create();
+        this.mvp = Utils.mat4Create();
+        this.norm = Utils.mat4Create();
+
+        // Persistent model rotation matrix
+        this.modelRotation = Utils.mat4Create();
+        this.tempMatrix = Utils.mat4Create();
+
+        // Initial rotation tilt
+        Utils.mat4RotateX(this.modelRotation, this.modelRotation, 0.35);
+
+        this.lightDirWorld = [0.0, 0.7, 1.0];
+    }
+
+    async init() {
+        if (!navigator.gpu) {
+            throw new Error("WebGPU not supported in this browser!");
+        }
+
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+            throw new Error("No appropriate GPUAdapter found!");
+        }
+
+        this.device = await adapter.requestDevice();
+        this.context = this.canvas.getContext("webgpu");
+        this.colorFormat = navigator.gpu.getPreferredCanvasFormat();
+
+        // Configure Canvas Context
+        this.resizeCanvas();
+        this.context.configure({
+            device: this.device,
+            format: this.colorFormat,
+            alphaMode: "premultiplied"
+        });
+
+        // Initialize Renderers
+        this.terrainRenderer = await TerrainRenderer.create(this.device, this.colorFormat, this.depthFormat);
+        this.boxRenderer = await BoxRenderer.create(this.device, this.colorFormat, this.depthFormat);
+
+        // Setup Voxel Mesh
+        this.updateVoxelMesh();
+
+        // Start frame loop
+        this.start();
+    }
+
+    resizeCanvas() {
+        const dpr = window.devicePixelRatio || 1;
+        const w = (this.canvas.clientWidth * dpr) | 0;
+        const h = (this.canvas.clientHeight * dpr) | 0;
+
+        if (this.canvas.width !== w || this.canvas.height !== h) {
+            this.canvas.width = w;
+            this.canvas.height = h;
+
+            // Recreate depth texture on resize
+            if (this.depthTexture) this.depthTexture.destroy();
+            this.depthTexture = this.device.createTexture({
+                size: [w, h],
+                format: this.depthFormat,
+                usage: GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+
+            // Update projection matrix
+            const aspect = w / h;
+            Utils.mat4Perspective(this.proj, Math.PI / 6, aspect, 0.1, 100);
+        }
+    }
+
+    updateVoxelMesh() {
+        const meshData = this.voxelGrid.generateMesh();
+        this.terrainRenderer.updateMesh(meshData);
+    }
+
+    getMouse3D(camPos, ndcX, ndcY) {
+        const rayDir = [ndcX, ndcY, 0];
+        rayDir[0] -= camPos[0];
+        rayDir[1] -= camPos[1];
+        rayDir[2] -= camPos[2];
+        // Placeholder console log matched from original engine.js
+        console.log("RayDir:", rayDir);
+    }
+
+    update() {
+        const input = window.inputState || { 
+            deltaX: 0, deltaY: 0, velocityX: 0, velocityY: 0, 
+            zoom: 7, interacting: false, mouseX: 0, mouseY: 0, 
+            ndcX: 0, ndcY: 0 
+        };
+
         let dx = 0, dy = 0;
-
         if (input.interacting) {
             dx = input.deltaX;
             dy = input.deltaY;
@@ -381,40 +548,41 @@ async function init() {
             const inc = Utils.mat4Create();
             Utils.mat4RotateY(inc, inc, dx);
             Utils.mat4RotateX(inc, inc, dy);
-            Utils.mat4Multiply(temp, inc, modelRotation);
-            modelRotation.set(temp);
+            Utils.mat4Multiply(this.tempMatrix, inc, this.modelRotation);
+            this.modelRotation.set(this.tempMatrix);
         }
 
-        // Update view matrix with current zoom
-        const cam_pos = [0, 0, input.zoom];
-        Utils.mat4LookAt(view, cam_pos, [0, 0, 0], [0, 1, 0]);
+        // Camera positioning with zoom
+        const camPos = [0, 0, input.zoom];
+        Utils.mat4LookAt(this.view, camPos, [0, 0, 0], [0, 1, 0]);
 
-        getMouse3D(cam_pos, input.ndcX, input.ndcY);
+        this.getMouse3D(camPos, input.ndcX, input.ndcY);
 
-        // MVP
-        Utils.mat4Multiply(mv, view, modelRotation);
-        Utils.mat4Multiply(mvp, proj, mv);
+        // Update MV and MVP matrices
+        Utils.mat4Multiply(this.mv, this.view, this.modelRotation);
+        Utils.mat4Multiply(this.mvp, this.proj, this.mv);
 
-        // Normal matrix (inverse-transpose of model-view)
-        // Utils.mat4InverseTranspose(norm, mv);
+        // Update normal matrix
+        Utils.mat4InverseTranspose(this.norm, this.mv);
 
-        // Update uniform data
-        const uniformData = new Float32Array(20); // mvp(16), lightDirWorld(3), padding(1)
-        uniformData.set(mvp, 0);
-        uniformData.set(lightDirWorld, 16);
-        
-        device.queue.writeBuffer(uniformBuffer, 0, uniformData);
+        // Update renderer uniform buffers
+        this.terrainRenderer.updateUniforms(this.mvp, this.lightDirWorld);
+        this.boxRenderer.updateUniforms(this.mvp, this.norm, this.lightDirWorld);
+    }
 
-        const commandEncoder = device.createCommandEncoder();
+    render() {
+        this.resizeCanvas();
+
+        const commandEncoder = this.device.createCommandEncoder();
         const renderPassDescriptor = {
             colorAttachments: [{
-                view: context.getCurrentTexture().createView(),
-                clearValue: clearColor,
+                view: this.context.getCurrentTexture().createView(),
+                clearValue: { r: 0.03, g: 0.03, b: 0.05, a: 1.0 },
                 loadOp: "clear",
                 storeOp: "store",
             }],
             depthStencilAttachment: {
-                view: depthTexture.createView(),
+                view: this.depthTexture.createView(),
                 depthClearValue: 1.0,
                 depthLoadOp: 'clear',
                 depthStoreOp: 'store',
@@ -422,18 +590,31 @@ async function init() {
         };
 
         const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
-        passEncoder.setPipeline(voxelPipeline);
-        passEncoder.setBindGroup(0, bindGroup);
-        passEncoder.setVertexBuffer(0, voxelVertexBuffer);
-        passEncoder.setIndexBuffer(voxelIndicesBuffer, 'uint16');
-        passEncoder.drawIndexed(voxelMesh.triangle_count);
-        passEncoder.end();
+        
+        // Draw terrain
+        this.terrainRenderer.draw(passEncoder);
 
-        device.queue.submit([commandEncoder.finish()]);
-        requestAnimationFrame(frame);
+        // Draw box (gizmo) if desired
+        // this.boxRenderer.draw(passEncoder);
+
+        passEncoder.end();
+        this.device.queue.submit([commandEncoder.finish()]);
     }
 
-    requestAnimationFrame(frame);
+    start() {
+        const frame = () => {
+            this.update();
+            this.render();
+            requestAnimationFrame(frame);
+        };
+        requestAnimationFrame(frame);
+    }
 }
 
-init();
+// Initialize the Engine on Page Load
+window.addEventListener("DOMContentLoaded", () => {
+    const engine = new Engine("canvas");
+    engine.init().catch(err => {
+        console.error("Failed to initialize WebGPU Engine:", err);
+    });
+});
