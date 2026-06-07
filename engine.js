@@ -1,24 +1,17 @@
 /** Plan *
  * Store 50 * 50 * 50 voxel initialized as flat plane
- * CPU takes 2d mouse position and gets the ray
+ * [] CPU takes 2d mouse position and gets the ray
  * Compute shader takes ray as a uniform (as well as brush info) and updates grid
  * Compute shader takes updated voxel buffer and outputs a vertex buffer with vertices and normals. This is where we use marching cubes
- * Render shader draws triangles using the generated vertex buffer
+ * [] Render shader draws triangles using the generated vertex buffer
  * Separate render shader draws mouse position
 */
 
 import * as Utils from './math_util.js';
+import { TerrainRenderer } from './TerrainRenderer.js';
 
 const VOXEL_RESOLUTION = 30;
 const NUM_POINTS = VOXEL_RESOLUTION * VOXEL_RESOLUTION * VOXEL_RESOLUTION;
-
-async function createShaderModule(device, path) {
-    const response = await fetch(path);
-    const shaderSource = await response.text();
-    return device.createShaderModule({
-        code: shaderSource
-    });
-}
 
 class VoxelGrid {
     constructor(resolution = VOXEL_RESOLUTION) {
@@ -181,240 +174,6 @@ class VoxelGrid {
     }
 }
 
-class TerrainRenderer {
-    static async create(device, colorFormat, depthFormat) {
-        const shaderModule = await createShaderModule(device, "./render.wgsl");
-        return new TerrainRenderer(device, shaderModule, colorFormat, depthFormat);
-    }
-
-    constructor(device, shaderModule, colorFormat, depthFormat) {
-        this.device = device;
-
-        // Create uniform buffer: MVP mat4x4f (64 bytes) + LightDir vec3f (12 bytes) + pad (4 bytes) = 80 bytes
-        this.uniformBuffer = device.createBuffer({
-            size: 80,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-
-        const vertexLayout = [{
-            attributes: [
-                { shaderLocation: 0, offset: 0, format: 'float32x3' },  // position
-                { shaderLocation: 1, offset: 12, format: 'float32x3' }, // normal
-                { shaderLocation: 2, offset: 24, format: 'float32x3' }  // color
-            ],
-            arrayStride: 36, // 9 floats * 4 bytes
-            stepMode: 'vertex'
-        }];
-
-        this.pipeline = device.createRenderPipeline({
-            label: "Terrain Render Pipeline",
-            layout: "auto",
-            vertex: {
-                module: shaderModule,
-                entryPoint: "vertex_main",
-                buffers: vertexLayout,
-            },
-            fragment: {
-                module: shaderModule,
-                entryPoint: "fragment_main",
-                targets: [{ format: colorFormat }],
-            },
-            primitive: {
-                topology: "triangle-list",
-                cullMode: 'back',
-            },
-            depthStencil: {
-                depthWriteEnabled: true,
-                depthCompare: 'less',
-                format: depthFormat,
-            },
-        });
-
-        this.bindGroup = device.createBindGroup({
-            layout: this.pipeline.getBindGroupLayout(0),
-            entries: [{
-                binding: 0,
-                resource: { buffer: this.uniformBuffer }
-            }]
-        });
-
-        this.vertexBuffer = null;
-        this.indexBuffer = null;
-        this.triangleCount = 0;
-    }
-
-    updateMesh(meshData) {
-        if (this.vertexBuffer) this.vertexBuffer.destroy();
-        if (this.indexBuffer) this.indexBuffer.destroy();
-
-        this.triangleCount = meshData.triangleCount;
-
-        if (meshData.vertexData.byteLength === 0) {
-            this.vertexBuffer = null;
-            this.indexBuffer = null;
-            return;
-        }
-
-        this.vertexBuffer = this.device.createBuffer({
-            size: meshData.vertexData.byteLength,
-            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-        });
-        this.indexBuffer = this.device.createBuffer({
-            size: meshData.triangleIndices.byteLength,
-            usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-        });
-
-        this.device.queue.writeBuffer(this.vertexBuffer, 0, meshData.vertexData);
-        this.device.queue.writeBuffer(this.indexBuffer, 0, meshData.triangleIndices);
-    }
-
-    updateUniforms(mvp, lightDir) {
-        const uniformData = new Float32Array(20); // mvp(16), lightDirWorld(3), padding(1)
-        uniformData.set(mvp, 0);
-        uniformData.set(lightDir, 16);
-        this.device.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
-    }
-
-    draw(passEncoder) {
-        if (!this.vertexBuffer || !this.indexBuffer || this.triangleCount === 0) return;
-
-        passEncoder.setPipeline(this.pipeline);
-        passEncoder.setBindGroup(0, this.bindGroup);
-        passEncoder.setVertexBuffer(0, this.vertexBuffer);
-        passEncoder.setIndexBuffer(this.indexBuffer, 'uint16');
-        passEncoder.drawIndexed(this.triangleCount);
-    }
-}
-
-// ============================================================
-//  5. BOX / GIZMO RENDERER PIPELINE
-// ============================================================
-class BoxRenderer {
-    static async create(device, colorFormat, depthFormat) {
-        const shaderModule = await createShaderModule(device, "./box.wgsl");
-        return new BoxRenderer(device, shaderModule, colorFormat, depthFormat);
-    }
-
-    constructor(device, shaderModule, colorFormat, depthFormat) {
-        this.device = device;
-
-        // Uniforms: MVP mat4x4f (64 bytes) + NormalMatrix mat4x4f (64 bytes) + LightDir vec3f (12 bytes) + pad (4 bytes) = 144 bytes
-        this.uniformBuffer = device.createBuffer({
-            size: 144,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-
-        const vertexLayout = [{
-            attributes: [
-                { shaderLocation: 0, offset: 0, format: 'float32x3' },  // position
-                { shaderLocation: 1, offset: 12, format: 'float32x3' }, // color
-                { shaderLocation: 2, offset: 24, format: 'float32x3' }  // normal
-            ],
-            arrayStride: 36, // 9 floats * 4 bytes
-            stepMode: 'vertex'
-        }];
-
-        this.pipeline = device.createRenderPipeline({
-            label: "Box Render Pipeline",
-            layout: "auto",
-            vertex: {
-                module: shaderModule,
-                entryPoint: "vertex_main",
-                buffers: vertexLayout,
-            },
-            fragment: {
-                module: shaderModule,
-                entryPoint: "fragment_main",
-                targets: [{ format: colorFormat }],
-            },
-            primitive: {
-                topology: "triangle-list",
-                cullMode: 'back',
-            },
-            depthStencil: {
-                depthWriteEnabled: true,
-                depthCompare: 'less',
-                format: depthFormat,
-            },
-        });
-
-        this.bindGroup = device.createBindGroup({
-            layout: this.pipeline.getBindGroupLayout(0),
-            entries: [{
-                binding: 0,
-                resource: { buffer: this.uniformBuffer }
-            }]
-        });
-
-        // Initialize static Box Mesh
-        const boxMesh = this.generateBoxMesh();
-        this.vertexBuffer = device.createBuffer({
-            size: boxMesh.vertexData.byteLength,
-            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-        });
-        this.indexBuffer = device.createBuffer({
-            size: boxMesh.triangleIndices.byteLength,
-            usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-        });
-
-        device.queue.writeBuffer(this.vertexBuffer, 0, boxMesh.vertexData);
-        device.queue.writeBuffer(this.indexBuffer, 0, boxMesh.triangleIndices);
-        this.triangleCount = boxMesh.triangleCount;
-    }
-
-    generateBoxMesh() {
-        // 6 faces, each with 4 unique vertices (for flat normals), 2 triangles
-        // We will build a single bottom face for this demo, or we can uncomment others if desired.
-        const faceData = [
-            // bottom – gold
-            { verts: [[-1, 0, -1], [1, 0, -1], [1, 0, 1], [-1, 0, 1]], n: [0, -1, 0], color: [1.00, 0.75, 0.20] }, 
-        ];
-
-        const vertexData = [];
-        const triangleIndices = [];
-        const lineIndices = [];
-
-        faceData.forEach((face, i) => {
-            const base = i * 4;
-            face.verts.forEach(v => {
-                vertexData.push(...v);          // pos (3)
-                vertexData.push(...face.color); // color (3)
-                vertexData.push(...face.n);     // normal (3)
-            });
-
-            lineIndices.push(base, base + 1, base + 1, base + 2, base + 2, base + 3, base + 3, base);
-            triangleIndices.push(base, base + 1, base + 2, base, base + 2, base + 3);
-        });
-
-        return {
-            vertexData: new Float32Array(vertexData),
-            triangleIndices: new Uint16Array(triangleIndices),
-            lineIndices: new Uint16Array(lineIndices),
-            triangleCount: triangleIndices.length,
-            lineCount: lineIndices.length
-        };
-    }
-
-    updateUniforms(mvp, normalMatrix, lightDir) {
-        const uniformData = new Float32Array(36); // mvp(16), normalMatrix(16), lightDirWorld(3), padding(1)
-        uniformData.set(mvp, 0);
-        uniformData.set(normalMatrix, 16);
-        uniformData.set(lightDir, 32);
-        this.device.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
-    }
-
-    draw(passEncoder) {
-        passEncoder.setPipeline(this.pipeline);
-        passEncoder.setBindGroup(0, this.bindGroup);
-        passEncoder.setVertexBuffer(0, this.vertexBuffer);
-        passEncoder.setIndexBuffer(this.indexBuffer, 'uint16');
-        passEncoder.drawIndexed(this.triangleCount);
-    }
-}
-
-// ============================================================
-//  6. MAIN ENGINE COORDINATOR
-// ============================================================
 class Engine {
     constructor(canvasId) {
         this.canvas = document.getElementById(canvasId);
@@ -430,7 +189,6 @@ class Engine {
 
         // Renderers
         this.terrainRenderer = null;
-        this.boxRenderer = null;
 
         // Voxel Grid
         this.voxelGrid = new VoxelGrid();
@@ -450,6 +208,20 @@ class Engine {
         Utils.mat4RotateX(this.modelRotation, this.modelRotation, 0.35);
 
         this.lightDirWorld = [0.0, 0.7, 1.0];
+    }
+
+    async createStorageBuffers() {
+        const gridBufferSize = NUM_POINTS * 4;
+        this.gridBuffer = this.device.createBuffer({
+            size: gridBufferSize,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+
+        const cursorBufferSize = 16;
+        this.cursorBuffer = this.device.createBuffer({
+            size: cursorBufferSize,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
     }
 
     async init() {
@@ -476,7 +248,6 @@ class Engine {
 
         // Initialize Renderers
         this.terrainRenderer = await TerrainRenderer.create(this.device, this.colorFormat, this.depthFormat);
-        this.boxRenderer = await BoxRenderer.create(this.device, this.colorFormat, this.depthFormat);
 
         // Setup Voxel Mesh
         this.updateVoxelMesh();
@@ -513,13 +284,15 @@ class Engine {
         this.terrainRenderer.updateMesh(meshData);
     }
 
-    getMouse3D(camPos, ndcX, ndcY) {
+    getMouseRay(camPos, ndcX, ndcY) {
         const rayDir = [ndcX, ndcY, 0];
         rayDir[0] -= camPos[0];
         rayDir[1] -= camPos[1];
         rayDir[2] -= camPos[2];
+
         // Placeholder console log matched from original engine.js
-        console.log("RayDir:", rayDir);
+        //console.log("RayDir:", rayDir);
+        return rayDir, camPos;
     }
 
     update() {
@@ -556,7 +329,7 @@ class Engine {
         const camPos = [0, 0, input.zoom];
         Utils.mat4LookAt(this.view, camPos, [0, 0, 0], [0, 1, 0]);
 
-        this.getMouse3D(camPos, input.ndcX, input.ndcY);
+        const [mouseRayDir, mouseOrigin] = this.getMouseRay(camPos, input.ndcX, input.ndcY);
 
         // Update MV and MVP matrices
         Utils.mat4Multiply(this.mv, this.view, this.modelRotation);
@@ -567,7 +340,6 @@ class Engine {
 
         // Update renderer uniform buffers
         this.terrainRenderer.updateUniforms(this.mvp, this.lightDirWorld);
-        this.boxRenderer.updateUniforms(this.mvp, this.norm, this.lightDirWorld);
     }
 
     render() {
@@ -593,9 +365,6 @@ class Engine {
         
         // Draw terrain
         this.terrainRenderer.draw(passEncoder);
-
-        // Draw box (gizmo) if desired
-        // this.boxRenderer.draw(passEncoder);
 
         passEncoder.end();
         this.device.queue.submit([commandEncoder.finish()]);
