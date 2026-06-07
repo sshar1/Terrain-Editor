@@ -17,6 +17,14 @@ window.inputState = {
 
     // Whether user is currently interacting
     interacting: false,
+
+    // Current mouse coordinates relative to the canvas client bounds
+    mouseX: 0,
+    mouseY: 0,
+
+    // Normalized Device Coordinates (NDC) in range [-1.0, 1.0]
+    ndcX: 0,
+    ndcY: 0,
 };
 
 (function () {
@@ -77,6 +85,22 @@ window.inputState = {
 
     mc.on('pinchend pinchcancel', function () {
         window.inputState.interacting = false;
+    });
+
+    // ---- Mouse/Touch position tracking ----
+    canvas.addEventListener('pointermove', function (e) {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+
+        window.inputState.mouseX = x;
+        window.inputState.mouseY = y;
+
+        // Normalized Device Coordinates (NDC)
+        // ndcX: -1.0 (left) to 1.0 (right)
+        // ndcY: 1.0 (top) to -1.0 (bottom)
+        window.inputState.ndcX = (x / rect.width) * 2.0 - 1.0;
+        window.inputState.ndcY = 1.0 - (y / rect.height) * 2.0;
     });
 
     // ---- Mouse wheel fallback for desktop zoom ----
