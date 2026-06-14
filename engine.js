@@ -9,8 +9,9 @@
 
 import * as Utils from './math_util.js';
 import { TerrainRenderer } from './TerrainRenderer.js';
+import { GridUpdater } from './GridUpdater.js';
 
-const VOXEL_RESOLUTION = 30;
+const VOXEL_RESOLUTION = 32;
 const NUM_POINTS = VOXEL_RESOLUTION * VOXEL_RESOLUTION * VOXEL_RESOLUTION;
 
 class VoxelGrid {
@@ -246,8 +247,13 @@ class Engine {
             alphaMode: "premultiplied"
         });
 
+        await this.createStorageBuffers();
+
         // Initialize Renderers
         this.terrainRenderer = await TerrainRenderer.create(this.device, this.colorFormat, this.depthFormat);
+
+        // Initialize computers
+        this.gridUpdater = await GridUpdater.create(this.device, this.gridBuffer, this.cursorBuffer, VOXEL_RESOLUTION);
 
         // Setup Voxel Mesh
         this.updateVoxelMesh();
@@ -340,6 +346,7 @@ class Engine {
 
         // Update renderer uniform buffers
         this.terrainRenderer.updateUniforms(this.mvp, this.lightDirWorld);
+        this.gridUpdater.updateUniforms(this.mvp, mouseOrigin, mouseRayDir);
     }
 
     render() {
@@ -361,12 +368,16 @@ class Engine {
             },
         };
 
-        const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
+        const renderPassEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
+        const computePassEncoder = commandEncoder.beginComputePass();
+
+        // Update terrain
+        this.gridUpdater.compute(computePassEncoder);
         
         // Draw terrain
-        this.terrainRenderer.draw(passEncoder);
+        this.terrainRenderer.draw(renderPassEncoder);
 
-        passEncoder.end();
+        renderPassEncoder.end();
         this.device.queue.submit([commandEncoder.finish()]);
     }
 

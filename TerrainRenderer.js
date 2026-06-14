@@ -8,7 +8,7 @@ async function createShaderModule(device, path) {
 
 export class TerrainRenderer {
     static async create(device, colorFormat, depthFormat) {
-        const shaderModule = await createShaderModule(device, "./render.wgsl");
+        const shaderModule = await createShaderModule(device, "./shaders/render.wgsl");
         return new TerrainRenderer(device, shaderModule, colorFormat, depthFormat);
     }
 
