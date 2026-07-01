@@ -99,7 +99,7 @@ export class GridUpdater {
 
         // Set default brush size and strength
         this.brushSize = 0.5;
-        this.brushStrength = 0.1;
+        this.brushStrength = 0.01;
         this.setBrush(this.brushSize, this.brushStrength);
     }
 
@@ -110,12 +110,14 @@ export class GridUpdater {
         this.device.queue.writeBuffer(this.updateUniformBuffer, 0, data);
     }
 
-    updateUniforms(mvp, ray_origin, ray_dir) {
-        // mat(16) + ray_origin (3) + _pad0(1) + ray_dir(3) + _pad1(1)
+    updateUniforms(mvp, ray_origin, ray_dir, resolution, sculptEnabled) {
+        // mat(16) + ray_origin(3) + resolution(1) + ray_dir(3) + sculptEnabled(1) = 24 floats = 96 bytes
         const uniformData = new Float32Array(24);
         uniformData.set(mvp, 0);
         uniformData.set(ray_origin, 16);
+        uniformData[19] = resolution;          // slot that was _pad0 in the old shader
         uniformData.set(ray_dir, 20);
+        uniformData[23] = sculptEnabled ? 1.0 : 0.0; // slot that was _pad1 in the old shader
         this.device.queue.writeBuffer(this.hitUniformBuffer, 0, uniformData);
     }
 
@@ -126,11 +128,9 @@ export class GridUpdater {
         passEncoder.dispatchWorkgroups(1);
 
         // 2. Run the grid update
-        const numGroups = this.resolution / 8;
+        const numGroups = this.resolution / 4;
         passEncoder.setPipeline(this.updatePipeline);
         passEncoder.setBindGroup(0, this.updateBindGroup);
         passEncoder.dispatchWorkgroups(numGroups, numGroups, numGroups);
-
-        passEncoder.end();
     }
 }

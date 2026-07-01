@@ -25,7 +25,19 @@ window.inputState = {
     // Normalized Device Coordinates (NDC) in range [-1.0, 1.0]
     ndcX: 0,
     ndcY: 0,
+
+    // Sculpting mode: true while Q is held down
+    sculptMode: false,
 };
+
+// Track Q key for sculpt mode
+document.addEventListener('keydown', function(e) {
+    if (e.code === 'KeyQ' && !e.repeat) window.inputState.sculptMode = true;
+});
+document.addEventListener('keyup', function(e) {
+    if (e.code === 'KeyQ') window.inputState.sculptMode = false;
+});
+
 
 (function () {
     const canvas = document.getElementById("canvas");

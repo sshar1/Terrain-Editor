@@ -1,178 +1,35 @@
 /** Plan *
- * Store 50 * 50 * 50 voxel initialized as flat plane
- * [] CPU takes 2d mouse position and gets the ray
- * Compute shader takes ray as a uniform (as well as brush info) and updates grid
- * Compute shader takes updated voxel buffer and outputs a vertex buffer with vertices and normals. This is where we use marching cubes
- * [] Render shader draws triangles using the generated vertex buffer
- * Separate render shader draws mouse position
-*/
+ * Store 32 * 32 * 32 voxel grid initialized as a flat plane.
+ * CPU takes 2D mouse position and computes the ray (NDC → model space).
+ * Compute shader (mouseHit.wgsl) casts the ray against the grid to find the
+ *   cursor position when Q is held.
+ * Compute shader (update.wgsl) sculpts the grid using the cursor position.
+ * Compute shader (marchingCubes.wgsl) extracts a triangle mesh from the grid.
+ * Render shader (render.wgsl) draws the mesh with lighting.
+ */
 
 import * as Utils from './math_util.js';
 import { TerrainRenderer } from './TerrainRenderer.js';
 import { GridUpdater } from './GridUpdater.js';
+import { VertexStreamer } from './VertexStreamer.js';
 
 const VOXEL_RESOLUTION = 32;
 const NUM_POINTS = VOXEL_RESOLUTION * VOXEL_RESOLUTION * VOXEL_RESOLUTION;
 
-class VoxelGrid {
-    constructor(resolution = VOXEL_RESOLUTION) {
-        this.resolution = resolution;
-        this.numPoints = resolution * resolution * resolution;
-        this.data = new Array(this.numPoints).fill(0);
-        this.initDefaultPlane();
-    }
-
-    set(val, x, y, z) {
-        if (x >= this.resolution || y >= this.resolution || z >= this.resolution) return;
-        if (x < 0 || y < 0 || z < 0) return;
-        this.data[z * this.resolution ** 2 + y * this.resolution + x] = val;
-    }
-
-    get(x, y, z) {
-        if (x >= this.resolution || y >= this.resolution || z >= this.resolution) return -1;
-        if (x < 0 || y < 0 || z < 0) return -1;
-        return this.data[z * this.resolution ** 2 + y * this.resolution + x];
-    }
-
-    initDefaultPlane() {
-        // Initialize a flat plane at y = 1
-        for (let z = 0; z < this.resolution; z++) {
-            for (let x = 0; x < this.resolution; x++) {
-                this.set(1, x, 1, z);
-            }
+/**
+ * Creates the initial scalar-field Float32Array for the GPU grid buffer.
+ * Sets density = 1.0 for every voxel in the y = 1 slice, producing a
+ * flat plane near the bottom of the [-1, 1]^3 volume.
+ */
+function createInitialGrid(resolution = VOXEL_RESOLUTION) {
+    const data = new Float32Array(resolution * resolution * resolution);
+    for (let z = 0; z < resolution; z++) {
+        for (let x = 0; x < resolution; x++) {
+            // flat index for (x, y=1, z)
+            data[x + 1 * resolution + z * resolution * resolution] = 1.0;
         }
     }
-
-    generateMesh() {
-        const vertexData = [];
-        const triangleIndices = [];
-        const lineIndices = [];
-
-        const h = 2.0 / this.resolution;
-        const topColor = [0.3, 0.65, 0.3];
-        const sideColor = [0.5, 0.4, 0.3];
-
-        for (let z = 0; z < this.resolution; z++) {
-            for (let y = 0; y < this.resolution; y++) {
-                for (let x = 0; x < this.resolution; x++) {
-                    if (this.get(x, y, z) === 1) {
-                        const xMin = -1.0 + x * h;
-                        const xMax = -1.0 + (x + 1) * h;
-                        const yMin = -1.0 + y * h;
-                        const yMax = -1.0 + (y + 1) * h;
-                        const zMin = -1.0 + z * h;
-                        const zMax = -1.0 + (z + 1) * h;
-
-                        const faces = [];
-
-                        // Front face (normal [0, 0, 1])
-                        if (this.get(x, y, z + 1) !== 1) {
-                            faces.push({
-                                verts: [
-                                    [xMin, yMin, zMax],
-                                    [xMax, yMin, zMax],
-                                    [xMax, yMax, zMax],
-                                    [xMin, yMax, zMax]
-                                ],
-                                n: [0, 0, 1],
-                                color: sideColor
-                            });
-                        }
-
-                        // Back face (normal [0, 0, -1])
-                        if (this.get(x, y, z - 1) !== 1) {
-                            faces.push({
-                                verts: [
-                                    [xMax, yMin, zMin],
-                                    [xMin, yMin, zMin],
-                                    [xMin, yMax, zMin],
-                                    [xMax, yMax, zMin]
-                                ],
-                                n: [0, 0, -1],
-                                color: sideColor
-                            });
-                        }
-
-                        // Top face (normal [0, 1, 0])
-                        if (this.get(x, y + 1, z) !== 1) {
-                            faces.push({
-                                verts: [
-                                    [xMin, yMax, zMax],
-                                    [xMax, yMax, zMax],
-                                    [xMax, yMax, zMin],
-                                    [xMin, yMax, zMin]
-                                ],
-                                n: [0, 1, 0],
-                                color: topColor
-                            });
-                        }
-
-                        // Bottom face (normal [0, -1, 0])
-                        if (this.get(x, y - 1, z) !== 1) {
-                            faces.push({
-                                verts: [
-                                    [xMin, yMin, zMin],
-                                    [xMax, yMin, zMin],
-                                    [xMax, yMin, zMax],
-                                    [xMin, yMin, zMax]
-                                ],
-                                n: [0, -1, 0],
-                                color: sideColor
-                            });
-                        }
-
-                        // Right face (normal [1, 0, 0])
-                        if (this.get(x + 1, y, z) !== 1) {
-                            faces.push({
-                                verts: [
-                                    [xMax, yMin, zMax],
-                                    [xMax, yMin, zMin],
-                                    [xMax, yMax, zMin],
-                                    [xMax, yMax, zMax]
-                                ],
-                                n: [1, 0, 0],
-                                color: sideColor
-                            });
-                        }
-
-                        // Left face (normal [-1, 0, 0])
-                        if (this.get(x - 1, y, z) !== 1) {
-                            faces.push({
-                                verts: [
-                                    [xMin, yMin, zMin],
-                                    [xMin, yMin, zMax],
-                                    [xMin, yMax, zMax],
-                                    [xMin, yMax, zMin]
-                                ],
-                                n: [-1, 0, 0],
-                                color: sideColor
-                            });
-                        }
-
-                        faces.forEach(face => {
-                            const base = vertexData.length / 9; // 9 elements per vertex
-                            face.verts.forEach(v => {
-                                vertexData.push(...v);          // pos (3 floats)
-                                vertexData.push(...face.n);     // normal (3 floats)
-                                vertexData.push(...face.color); // color (3 floats)
-                            });
-
-                            lineIndices.push(base, base + 1, base + 1, base + 2, base + 2, base + 3, base + 3, base);
-                            triangleIndices.push(base, base + 1, base + 2, base, base + 2, base + 3);
-                        });
-                    }
-                }
-            }
-        }
-
-        return {
-            vertexData: new Float32Array(vertexData),
-            triangleIndices: new Uint16Array(triangleIndices),
-            lineIndices: new Uint16Array(lineIndices),
-            triangleCount: triangleIndices.length,
-            lineCount: lineIndices.length
-        };
-    }
+    return data;
 }
 
 class Engine {
@@ -191,8 +48,7 @@ class Engine {
         // Renderers
         this.terrainRenderer = null;
 
-        // Voxel Grid
-        this.voxelGrid = new VoxelGrid();
+        // (Grid data is GPU-resident; initial upload happens in init())
 
         // Matrices
         this.proj = Utils.mat4Create();
@@ -249,14 +105,15 @@ class Engine {
 
         await this.createStorageBuffers();
 
+        // Upload the initial flat-plane grid to the GPU
+        this.device.queue.writeBuffer(this.gridBuffer, 0, createInitialGrid());
+
         // Initialize Renderers
         this.terrainRenderer = await TerrainRenderer.create(this.device, this.colorFormat, this.depthFormat);
 
         // Initialize computers
         this.gridUpdater = await GridUpdater.create(this.device, this.gridBuffer, this.cursorBuffer, VOXEL_RESOLUTION);
-
-        // Setup Voxel Mesh
-        this.updateVoxelMesh();
+        this.vertexStreamer = await VertexStreamer.create(this.device, this.gridBuffer, this.gridUpdater.updateUniformBuffer, VOXEL_RESOLUTION);
 
         // Start frame loop
         this.start();
@@ -285,20 +142,47 @@ class Engine {
         }
     }
 
-    updateVoxelMesh() {
-        const meshData = this.voxelGrid.generateMesh();
-        this.terrainRenderer.updateMesh(meshData);
-    }
+    // Returns { origin, dir } both in model space (the same space as the grid).
+    // Correct unprojection: NDC → view-space → world-space → model-space.
+    getMouseRay(ndcX, ndcY) {
+        // 1. View-space ray direction.
+        //    For perspective proj P, a pixel at NDC (nx,ny) corresponds to
+        //    view-space direction (nx/P[0], ny/P[5], -1) before normalisation.
+        const P  = this.proj;
+        const vx = ndcX / P[0];  // P[0] = f / aspect
+        const vy = ndcY / P[5];  // P[5] = f
 
-    getMouseRay(camPos, ndcX, ndcY) {
-        const rayDir = [ndcX, ndcY, 0];
-        rayDir[0] -= camPos[0];
-        rayDir[1] -= camPos[1];
-        rayDir[2] -= camPos[2];
+        // 2. World-space direction: inv(V_rot) * viewDir = V_rot^T * viewDir.
+        //    In column-major V, row i of V_rot^T = column i of V_rot.
+        //    out[i] = sum_j  V[i*4 + j] * v[j]
+        const V  = this.view;
+        const wx = V[0]*vx + V[1]*vy + V[2]*(-1.0);
+        const wy = V[4]*vx + V[5]*vy + V[6]*(-1.0);
+        const wz = V[8]*vx + V[9]*vy + V[10]*(-1.0);
 
-        // Placeholder console log matched from original engine.js
-        //console.log("RayDir:", rayDir);
-        return rayDir, camPos;
+        // Camera world position: -R^T * t  where t = V[12..14]
+        const cpx = -(V[0]*V[12] + V[1]*V[13] + V[2]*V[14]);
+        const cpy = -(V[4]*V[12] + V[5]*V[13] + V[6]*V[14]);
+        const cpz = -(V[8]*V[12] + V[9]*V[13] + V[10]*V[14]);
+
+        // 3. Model-space: inv(modelRotation) * v = modelRotation^T * v.
+        //    Same formula as step 2 but with this.modelRotation.
+        const MR = this.modelRotation;
+        const ox = MR[0]*cpx + MR[1]*cpy + MR[2]*cpz;
+        const oy = MR[4]*cpx + MR[5]*cpy + MR[6]*cpz;
+        const oz = MR[8]*cpx + MR[9]*cpy + MR[10]*cpz;
+
+        const dx = MR[0]*wx + MR[1]*wy + MR[2]*wz;
+        const dy = MR[4]*wx + MR[5]*wy + MR[6]*wz;
+        const dz = MR[8]*wx + MR[9]*wy + MR[10]*wz;
+
+        const len = Math.hypot(dx, dy, dz);
+        if (len < 1e-6) return { origin: [ox, oy, oz], dir: [0, 0, -1] };
+
+        return {
+            origin: [ox, oy, oz],
+            dir:    [dx/len, dy/len, dz/len],
+        };
     }
 
     update() {
@@ -335,7 +219,7 @@ class Engine {
         const camPos = [0, 0, input.zoom];
         Utils.mat4LookAt(this.view, camPos, [0, 0, 0], [0, 1, 0]);
 
-        const [mouseRayDir, mouseOrigin] = this.getMouseRay(camPos, input.ndcX, input.ndcY);
+        const ray = this.getMouseRay(input.ndcX, input.ndcY);
 
         // Update MV and MVP matrices
         Utils.mat4Multiply(this.mv, this.view, this.modelRotation);
@@ -345,12 +229,16 @@ class Engine {
         Utils.mat4InverseTranspose(this.norm, this.mv);
 
         // Update renderer uniform buffers
+        const sculptEnabled = (window.inputState && window.inputState.sculptMode) || false;
         this.terrainRenderer.updateUniforms(this.mvp, this.lightDirWorld);
-        this.gridUpdater.updateUniforms(this.mvp, mouseOrigin, mouseRayDir);
+        this.gridUpdater.updateUniforms(this.mvp, ray.origin, ray.dir, VOXEL_RESOLUTION, sculptEnabled);
     }
 
     render() {
         this.resizeCanvas();
+
+        // Reset the indirect draw counter on the GPU before execution
+        this.device.queue.writeBuffer(this.vertexStreamer.indirectBuffer, 0, new Uint32Array([0, 1, 0, 0]));
 
         const commandEncoder = this.device.createCommandEncoder();
         const renderPassDescriptor = {
@@ -368,16 +256,19 @@ class Engine {
             },
         };
 
-        const renderPassEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
         const computePassEncoder = commandEncoder.beginComputePass();
-
-        // Update terrain
         this.gridUpdater.compute(computePassEncoder);
-        
-        // Draw terrain
-        this.terrainRenderer.draw(renderPassEncoder);
+        this.vertexStreamer.compute(computePassEncoder);
+        computePassEncoder.end();
 
+        const renderPassEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
+        this.terrainRenderer.draw(
+            renderPassEncoder,
+            this.vertexStreamer.vertexBuffer,
+            this.vertexStreamer.indirectBuffer
+        );
         renderPassEncoder.end();
+
         this.device.queue.submit([commandEncoder.finish()]);
     }
 

@@ -46,7 +46,7 @@ export class TerrainRenderer {
             },
             primitive: {
                 topology: "triangle-list",
-                cullMode: 'back',
+                cullMode: 'none',
             },
             depthStencil: {
                 depthWriteEnabled: true,
@@ -100,7 +100,15 @@ export class TerrainRenderer {
         this.device.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
     }
 
-    draw(passEncoder) {
+    draw(passEncoder, vertexBuffer, indirectBuffer) {
+        if (vertexBuffer && indirectBuffer) {
+            passEncoder.setPipeline(this.pipeline);
+            passEncoder.setBindGroup(0, this.bindGroup);
+            passEncoder.setVertexBuffer(0, vertexBuffer);
+            passEncoder.drawIndirect(indirectBuffer, 0);
+            return;
+        }
+
         if (!this.vertexBuffer || !this.indexBuffer || this.triangleCount === 0) return;
 
         passEncoder.setPipeline(this.pipeline);
